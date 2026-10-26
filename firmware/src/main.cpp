@@ -6,24 +6,22 @@
 #include <SPI.h>
 #include <Wire.h>
 #include "quad_state_model/quad_state_model.hpp"
+#include "attitude_estimator/attitude_estimator.hpp"
 #include "drone_protocol.hpp"
 
 using glm::ivec3; using glm::fquat;
 
 const int ACCEL_ADDR = 0x53; 
 const int GYRO_ADDR = 0x68;
-const int MAGN_ADDR = 0x1E;
+const int MAGN_ADDR = 0x2C;
 const int ACCEL_START = 0x32;
 const int GYRO_START = 0x1D;
-const int MAGN_START = 0x03;
+const int MAGN_START = 0x01;
 const float ACCEL_SCALE = 0.0383;
 const float GYRO_SCALE = (1.0/14.375) * (PI / 180.0);
-const float MAGN_SCALE = 10.0/109.0;
-const int SDA = 33;
-const int SCL = 35;
-
-const float ACCEL_SCALE = 16384.0; // For ±2g range
-const float GYRO_SCALE = 16.4; // 16.4; // 32.8; // 65.5; // 131.0;
+const float MAGN_SCALE = 100.0f / 3750.0f;
+const int SOFT_SDA = 12;
+const int SOFT_SCL = 13;
 
 uint8_t buffer[6];
 ivec3 rawAccel;
@@ -38,7 +36,7 @@ uint32_t lastMicros = 0;
 float dt;
 
 const glm::fquat identity = glm::fquat(1.0f, 0.0f, 0.0f, 0.0f);
-QuadModel* drone;
+AttitudeEstimator* filter;
 
 vec3 a_bias;
 vec3 g_bias;
@@ -46,48 +44,41 @@ vec3 m_bias;
 
 void calibrateIMU(int times);
 
+uint8_t readReg(uint8_t addr, uint8_t reg) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint16_t)addr, (size_t)1, true);
+  return Wire.read();
+}
+
+void writeReg(uint8_t addr, uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(addr); Wire.write(reg); Wire.write(val);
+  Wire.endTransmission(true);
+}
+
 void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
-  Wire.begin(SDA, SCL); 
+  delay(1000);
+  Wire.begin(SOFT_SDA, SOFT_SCL); 
 
   // accel
-  Wire.beginTransmission(ACCEL_ADDR);
-  Wire.write(0x2D); 
-  Wire.write(0x08);    
-  Wire.endTransmission(true);
-
-  Wire.beginTransmission(ACCEL_ADDR);
-  Wire.write(0x31); 
-  Wire.write(0x0B);    
-  Wire.endTransmission(true);
+  writeReg(ACCEL_ADDR, 0x2C, 0x0A);
+  writeReg(ACCEL_ADDR, 0x2D, 0x08);
+  writeReg(ACCEL_ADDR, 0x31, 0x0B);
 
   // gyro 
-  Wire.beginTransmission(GYRO_ADDR);
-  Wire.write(0x3E);
-  Wire.write(0x01); 
-  Wire.endTransmission(true);
+  writeReg(GYRO_ADDR, 0x3E, 0x01);
+  writeReg(GYRO_ADDR, 0x16, 0x1B);
+  writeReg(GYRO_ADDR, 0x15, 0x04);
 
-  Wire.beginTransmission(GYRO_ADDR);
-  Wire.write(0x16);
-  Wire.write(0x18); 
-  Wire.endTransmission(true);
-
-  // magnetometer 
-  Wire.beginTransmission(MAGN_ADDR);
-  Wire.write(0x00);
-  Wire.write(0b01110100); 
-  Wire.endTransmission(true);
-
-  Wire.beginTransmission(MAGN_ADDR);
-  Wire.write(0x01);
-  Wire.write(0b00100000); 
-  Wire.endTransmission(true);
-
-  Wire.beginTransmission(MAGN_ADDR);
-  Wire.write(0x02);
-  Wire.write(0x00); 
-  Wire.endTransmission(true);
+  // --- magnetometer (QMC5883P @ 0x2C) ---
+  writeReg(MAGN_ADDR, 0x0B, 0x80);   // soft reset -> suspend mode, default registers
+  delay(5);
+  writeReg(MAGN_ADDR, 0x29, 0x06);   // axis signs (every datasheet example writes this first)
+  writeReg(MAGN_ADDR, 0x0B, 0x08);   // ±8 G, set/reset on
+  writeReg(MAGN_ADDR, 0x0A, 0xC3);   // normal mode, 200 Hz, OSR1=8, OSR2=8
 
   rawAccel = ivec3(0);
   rawGyro = ivec3(0);
@@ -103,7 +94,7 @@ void setup() {
   Serial.printf("Gyro bias: (%f, %f, %f)\n", g_bias.x, g_bias.y, g_bias.z);
   Serial.printf("Magn bias: (%f, %f, %f)\n", m_bias.x, m_bias.y, m_bias.z);
 
-  drone = new QuadModel(0.5, identity, mat3(1.0), mat4(1.0));
+  filter = new AttitudeEstimator(identity);
   delay(5000);
   lastMicros = micros();
 }
@@ -112,12 +103,12 @@ void loop() {
   // put your main code here, to run repeatedly:
 
   Wire.beginTransmission(ACCEL_ADDR);
-  Wire.write(0x32); 
-  uint8_t err = Wire.endTransmission(false); 
+  Wire.write(ACCEL_START); 
+  uint8_t err = Wire.endTransmission(true); 
   size_t got = Wire.requestFrom((uint16_t)ACCEL_ADDR, (size_t)6, true);
 
   if (got == 6) {
-    for (int i = 0; i++; i < 6){
+    for (int i = 0; i < 6; i++){
       buffer[i] = Wire.read();
     }
     rawAccel.x  = (int16_t)((buffer[1]  << 8) | buffer[0]);
@@ -125,13 +116,15 @@ void loop() {
     rawAccel.z  = (int16_t)((buffer[5]  << 8) | buffer[4]);
   }
 
+  // Serial.printf("requestFrom acc got=%u\n", (unsigned)got);
+
   Wire.beginTransmission(GYRO_ADDR);
-  Wire.write(0x1D); 
-  uint8_t err = Wire.endTransmission(false); 
+  Wire.write(GYRO_START); 
+  err = Wire.endTransmission(true); 
   got = Wire.requestFrom((uint16_t)GYRO_ADDR, (size_t)6, true);
 
   if (got == 6) {
-    for (int i = 0; i++; i < 6){
+    for (int i = 0; i < 6; i++){
       buffer[i] = Wire.read();
     }
     rawGyro.x  = (int16_t)((buffer[0]  << 8) | buffer[1]);
@@ -139,21 +132,23 @@ void loop() {
     rawGyro.z  = (int16_t)((buffer[4]  << 8) | buffer[5]);
   }
 
+  // Serial.printf("requestFrom gyro got=%u\n", (unsigned)got);
+
   Wire.beginTransmission(MAGN_ADDR);
-  Wire.write(0x03); 
-  uint8_t err = Wire.endTransmission(false); 
+  Wire.write(MAGN_START); 
+  err = Wire.endTransmission(false); 
   got = Wire.requestFrom((uint16_t)MAGN_ADDR, (size_t)6, true);
 
   if (got == 6) {
-    for (int i = 0; i++; i < 6){
+    for (int i = 0; i < 6; i++){
       buffer[i] = Wire.read();
     }
-    rawMagn.x  = (int16_t)((buffer[0]  << 8) | buffer[1]);
-    rawMagn.y  = (int16_t)((buffer[2]  << 8) | buffer[3]);
-    rawMagn.z  = (int16_t)((buffer[4]  << 8) | buffer[5]);
+    rawMagn.x  = (int16_t)((buffer[1]  << 8) | buffer[0]);
+    rawMagn.y  = (int16_t)((buffer[3]  << 8) | buffer[2]);
+    rawMagn.z  = (int16_t)((buffer[5]  << 8) | buffer[4]);
   }
   
-  Serial.printf("requestFrom got=%u\n", (unsigned)got);
+  // Serial.printf("requestFrom mag got=%u\n", (unsigned)got);
 
   
   scaledAccel.x = rawAccel.x * ACCEL_SCALE;
@@ -174,20 +169,24 @@ void loop() {
 
   scaledGyro = scaledGyro - g_bias;
   scaledAccel = scaledAccel - a_bias;
-  drone->updateAttitude(scaledGyro, scaledAccel, scaledMagn, dt, 0.1, 0.1);
+  filter->madgwickIMU(scaledGyro, scaledAccel, dt, 0.15);
   
   AttitudePacket pkt;
   pkt.start1 = 0xAA;
   pkt.start2 = 0x55;
-  pkt.w = drone->attitude.w;
-  pkt.x = drone->attitude.x;
-  pkt.y = drone->attitude.y;
-  pkt.z = drone->attitude.z;
+  pkt.w = filter->attitude_.w;
+  pkt.x = filter->attitude_.x;
+  pkt.y = filter->attitude_.y;
+  pkt.z = filter->attitude_.z;
   Serial.write((uint8_t*)&pkt, sizeof(pkt));
   Serial.flush();
-  
 
-  delay(10);
+  // Serial.printf("accel: %f %f %f\n", scaledAccel.x, scaledAccel.y, scaledAccel.z);
+  // Serial.printf("gyro: %f %f %f\n", scaledGyro.x, scaledGyro.y, scaledGyro.z);
+  // Serial.printf("magn: %f %f %f\n", scaledMagn.x, scaledMagn.y, scaledMagn.z);
+  // Serial.printf("quaternion: %f %f %f %f\n", filter->attitude.w, filter->attitude.x, filter->attitude.y, filter->attitude.z);
+
+  // delay(10);
 }
 
 void calibrateIMU(int times){
@@ -195,11 +194,11 @@ void calibrateIMU(int times){
   for (int i = 1; i <= times; i++){
     Wire.beginTransmission(ACCEL_ADDR);
     Wire.write(0x32); 
-    uint8_t err = Wire.endTransmission(false); 
+    uint8_t err = Wire.endTransmission(true); 
     size_t got = Wire.requestFrom((uint16_t)ACCEL_ADDR, (size_t)6, true);
 
     if (got == 6) {
-      for (int i = 0; i++; i < 6){
+      for (int i = 0; i < 6; i++){
         buffer[i] = Wire.read();
       }
       rawAccel.x  = (int16_t)((buffer[1]  << 8) | buffer[0]);
@@ -209,11 +208,11 @@ void calibrateIMU(int times){
 
     Wire.beginTransmission(GYRO_ADDR);
     Wire.write(0x1D); 
-    uint8_t err = Wire.endTransmission(false); 
+    err = Wire.endTransmission(true); 
     got = Wire.requestFrom((uint16_t)GYRO_ADDR, (size_t)6, true);
 
     if (got == 6) {
-      for (int i = 0; i++; i < 6){
+      for (int i = 0; i < 6; i++){
         buffer[i] = Wire.read();
       }
       rawGyro.x  = (int16_t)((buffer[0]  << 8) | buffer[1]);
@@ -224,7 +223,7 @@ void calibrateIMU(int times){
     // Convert to actual physical units
     a_bias.x += rawAccel.x * ACCEL_SCALE;
     a_bias.y += rawAccel.y * ACCEL_SCALE;
-    a_bias.z += rawAccel.z * ACCEL_SCALE - 1;
+    a_bias.z += rawAccel.z * ACCEL_SCALE - 9.80665;
     
     g_bias.x += (rawGyro.x * GYRO_SCALE);
     g_bias.y += (rawGyro.y * GYRO_SCALE);
