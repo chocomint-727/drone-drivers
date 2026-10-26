@@ -7,7 +7,7 @@
 using glm::vec3; using glm::fquat; using glm::normalize; using glm::cross; using glm::length; using glm::normalize;
 
 
-void AttitudeEstimator::madgwickMarg(const vec3& angularRate, const vec3& accelerations, const vec3& northHeading, float dt, float beta_g, float beta_b) {
+fquat AttitudeEstimator::madgwickMarg(const fquat& attitude_, const vec3& angularRate, const vec3& accelerations, const vec3& northHeading, float dt, float beta_g, float beta_b) const {
     vec3 a_norm = normalize(accelerations);
     vec3 n_norm = normalize(northHeading);
 
@@ -80,11 +80,11 @@ void AttitudeEstimator::madgwickMarg(const vec3& angularRate, const vec3& accele
 
     fquat q_omega = 0.5f * attitude_ * fquat(0.0, angularRate.x, angularRate.y, angularRate.z);   
     q_omega -= (beta_g * gradient_G) + (beta_b * gradient_E);
-    attitude_ += q_omega * dt;
-    attitude_ = normalize(attitude_);
+    fquat new_attitude = attitude_ + q_omega * dt;
+    return normalize(new_attitude);
 }
 
-void AttitudeEstimator::madgwickIMU(const vec3& angularRate, const vec3& accelerations, float dt, float beta_g) {
+fquat AttitudeEstimator::madgwickIMU(const fquat& attitude_, const vec3& angularRate, const vec3& accelerations, float dt, float beta_g) const {
     vec3 a_norm = normalize(accelerations);
 
     float qw = attitude_.w;
@@ -125,6 +125,6 @@ void AttitudeEstimator::madgwickIMU(const vec3& angularRate, const vec3& acceler
 
     fquat q_omega = 0.5f * attitude_ * fquat(0.0, angularRate.x, angularRate.y, angularRate.z);   
     q_omega -= (beta_g * gradient_G);
-    attitude_ += q_omega * dt;
-    attitude_ = normalize(attitude_);
+    fquat new_attitude = attitude_ + q_omega * dt;
+    return normalize(new_attitude);
 }

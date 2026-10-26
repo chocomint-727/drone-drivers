@@ -37,6 +37,7 @@ float dt;
 
 const glm::fquat identity = glm::fquat(1.0f, 0.0f, 0.0f, 0.0f);
 AttitudeEstimator* filter;
+QuadModel* drone;
 
 vec3 a_bias;
 vec3 g_bias;
@@ -94,7 +95,8 @@ void setup() {
   Serial.printf("Gyro bias: (%f, %f, %f)\n", g_bias.x, g_bias.y, g_bias.z);
   Serial.printf("Magn bias: (%f, %f, %f)\n", m_bias.x, m_bias.y, m_bias.z);
 
-  filter = new AttitudeEstimator(identity);
+  filter = new AttitudeEstimator();
+  drone = new QuadModel(0.5, identity, mat3(1.0), mat4(1.0));
   delay(5000);
   lastMicros = micros();
 }
@@ -169,15 +171,15 @@ void loop() {
 
   scaledGyro = scaledGyro - g_bias;
   scaledAccel = scaledAccel - a_bias;
-  filter->madgwickIMU(scaledGyro, scaledAccel, dt, 0.15);
+  drone->attitude = filter->madgwickIMU(drone->attitude, scaledGyro, scaledAccel, dt, 0.15);
   
   AttitudePacket pkt;
   pkt.start1 = 0xAA;
   pkt.start2 = 0x55;
-  pkt.w = filter->attitude_.w;
-  pkt.x = filter->attitude_.x;
-  pkt.y = filter->attitude_.y;
-  pkt.z = filter->attitude_.z;
+  pkt.w = drone->attitude.w;
+  pkt.x = drone->attitude.x;
+  pkt.y = drone->attitude.y;
+  pkt.z = drone->attitude.z;
   Serial.write((uint8_t*)&pkt, sizeof(pkt));
   Serial.flush();
 

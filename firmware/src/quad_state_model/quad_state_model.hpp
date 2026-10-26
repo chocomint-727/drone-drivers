@@ -8,6 +8,8 @@ using glm::vec3; using glm::fquat; using glm::vec4; using glm::mat3;using glm::m
 
 class QuadModel {
     public:
+        fquat attitude;
+        
         inline QuadModel(float mass, fquat attitude_, mat3 inertia_, mat4 motorMatrix_, double gravity = 9.81) {
             m = mass;
             attitude = attitude_;
@@ -29,7 +31,7 @@ class QuadModel {
         float m;
         
         vec3 g_;
-        fquat attitude;
+        
         mat3 inertia;
         mat4 motorMatrixInv;
         mat3 wKP;
